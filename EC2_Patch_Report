@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  AWS Lambda scheduled by Cloud Watch events, fetch the list of missing patches from EC2 instances
+  Based on the tag specified and sends the patch list to the SNS Topic
+
+Parameters:
+  LambdaRate:
+    Description: >
+      The rate (frequency) that determines when CloudWatch Events runs the rule that
+      triggers the Lambda function.
+    Default: rate(2 minutes)
+    Type: String
+  SNSTopicName:
+    Description: The SNS topic name to be created for notifications
+    Type: String
+    Default: PatchNotificatioinsTopic
+  Email:
+    Description: Email to subscribe for patch notifications
+    Type: String
+    Default: awsdevops14@gmail.com
+Resources:
+  PathReportLambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      RoleName: AutomationServiceRole
+      Policies:
+      - PolicyName: PatchReportLambdaPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ssm:DescribeInstancePatches
+                - sns:Publish
+              Resource: '*'
+  LambdaSchedule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: >
+        A schedule for the Lambda function..
+      ScheduleExpression: !Ref LambdaRate
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${PatchReportLambdaFunction.Arn}
+          Id: LambdaSchedule
+  SnsTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: "email"
+      TopicName: !Ref SNSTopicName
+  LambdaSchedulePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub ${PatchReportLambdaFunction.Arn}
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub ${LambdaSchedule.Arn}
+  PatchReportLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: >
+        Lambda function that sends missing patch list to SNS
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+
+          def lambda_handler(event, context):
+              TAG_KEY = os.getenv('TAG_KEY', 'Patch Report')
+              TAG_VALUE = os.getenv('TAG_VALUE', 'Yes')
+              SNS_ARN = os.getenv('SNS_ARN', 'arn:aws:sns:us-east-1:237243789465:patch-notifications')
+
+              ec2_client = boto3.client('ec2')
+              ssm_client = boto3.client('ssm')
+              sns_client = boto3.client('sns')
+
+              instance_key_filter = [{'Name': 'tag:{}'.format(TAG_KEY), 'Values': [TAG_VALUE]}]
+              response = ec2_client.describe_instances(Filters=instance_key_filter)
+
+              ec2paginator = ec2_client.get_paginator('describe_instances')
+              ec2_response_iterator = ec2paginator.paginate(Filters=instance_key_filter)
+
+              instance_ids = []
+              for ec2_response in ec2_response_iterator:
+                  for r in ec2_response['Reservations']:
+                      for instance in r['Instances']:
+                          instance_ids.append(instance['InstanceId'])
+
+              print("Fetched instance ids for path reports: {} ".format(instance_ids))
+              paginator = ssm_client.get_paginator('describe_instance_patches')
+
+              patch_report = dict()
+              for instance_id in instance_ids:
+                  response_iterator = paginator.paginate(InstanceId=instance_id)
+                  instance_pathces = list()
+                  for r in response_iterator:
+                      for patch in r['Patches']:
+                          patch_d = dict()
+                          if patch['State'] == "Missing":
+                              patch_d["Name"] = patch["Title"]
+                              patch_d["State"] = patch["State"]
+                              patch_d["Severity"] = patch["Severity"]
+                              patch_d["KBId"] = patch["KBId"]
+                              instance_pathces.append(patch_d)
+                  patch_report[instance_id] = instance_pathces
+
+              message = json.dumps(patch_report, indent=2, default=str)
+              sns_response = sns_client.publish(TargetArn=SNS_ARN, Message=message )
+              print(message)
+              print("---- Run Completed-----")
+              response = {"statusCode": 200, "body": message}
+              return response
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !Sub ${PathReportLambdaExecutionRole.Arn}
+      Runtime: python3.8
+      Timeout: 120
+      Environment:
+        Variables:
+          TAG_KEY: "Patch Report"
+          TAG_VALUE: "Yes"
+          SNS_ARN: !Ref SnsTopic
